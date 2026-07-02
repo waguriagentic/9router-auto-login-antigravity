@@ -104,7 +104,7 @@ import argparse  # noqa: E402
 # ============================================================
 # KONFIGURASI
 # ============================================================
-TARGET_URL = "http://localhost:20128/"
+TARGET_URL = "http://localhost:20128/dashboard/providers/antigravity"
 AKUN_FILE = os.path.join(SCRIPT_DIR, "akun.txt")
 DELAY_ANTAR_AKUN = 3  # detik
 
@@ -192,12 +192,74 @@ def safe_click(page, locator, timeout=10, desc="button"):
 # ============================================================
 # FUNGSI UTAMA: LOGIN SATU AKUN
 # ============================================================
+def force_input(page, locator, text, timeout=15, desc="field"):
+    """Input teks ke field dengan multiple fallback.
+
+    Google Login sering block .input() biasa karena JS event handler.
+    Urutan strategi:
+    1. Klik field -> .input() DrissionPage (paling clean)
+    2. Klik field -> ketik pake .type() satu-satu (simulasi keyboard)
+    3. Klik field -> run JS langsung set value + trigger event
+    """
+    ele = wait_and_find(page, locator, timeout=timeout, desc=desc)
+
+    # Strategi 1: .input() standar DrissionPage
+    try:
+        ele.click()
+        time.sleep(0.5)
+        ele.input(text, clear=True)
+        time.sleep(0.5)
+        # Cek apakah value masuk
+        val = ele.attr("value") or ""
+        if text in val:
+            return ele
+    except Exception:
+        pass
+
+    # Strategi 2: .type() — simulasi keyboard char-by-char
+    try:
+        ele.click()
+        time.sleep(0.3)
+        # Clear dulu pake Ctrl+A lalu Delete
+        page.actions.key_down("Control").type("a").key_up("Control").type("\b")
+        time.sleep(0.3)
+        page.actions.type(text)
+        time.sleep(0.5)
+        val = ele.attr("value") or ""
+        if text in val:
+            return ele
+    except Exception:
+        pass
+
+    # Strategi 3: JavaScript langsung
+    try:
+        ele.click()
+        time.sleep(0.3)
+        page.run_js(
+            """
+            const el = arguments[0];
+            const text = arguments[1];
+            el.focus();
+            el.value = text;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            """,
+            ele, text,
+        )
+        time.sleep(0.5)
+        return ele
+    except Exception:
+        pass
+
+    raise Exception(f"Gagal input teks ke {desc} dengan semua strategi")
+
+
 def login_account(account, index, total, headless=False):
     """Proses login untuk satu akun.
 
     Flow:
-    1. Buka browser -> Navigasi ke router
-    2. Klik Provider -> Antigravity -> Add -> Confirm
+    1. Buka browser -> Langsung ke halaman Antigravity
+    2. Klik Add -> Confirm
     3. Handle tab baru (Google Login)
     4. Input email & password
     5. Handle konfirmasi Google
@@ -211,7 +273,7 @@ def login_account(account, index, total, headless=False):
     print(f"{'=' * 55}")
 
     # --- Setup browser ---
-    print(" [1/8] Membuka browser...")
+    print(" [1/6] Membuka browser...")
     co = ChromiumOptions()
     co.set_argument("--start-maximized")
     co.set_argument("--disable-blink-features=AutomationControlled")
@@ -224,59 +286,13 @@ def login_account(account, index, total, headless=False):
     page = ChromiumPage(co)
 
     try:
-        # --- Navigasi ke router ---
-        print(f" [2/8] Navigasi ke {TARGET_URL}")
+        # --- Langsung ke halaman Antigravity ---
+        print(f" [2/6] Navigasi ke {TARGET_URL}")
         page.get(TARGET_URL)
-        time.sleep(2)
-
-        # --- Klik Provider ---
-        print(" [3/8] Klik menu 'Provider'...")
-        # Cari berdasarkan TEKS, bukan CSS selector
-        provider_btn = None
-        # Coba beberapa cara cari Provider
-        for locator in [
-            "@text()=Provider",
-            "@text():Provider",
-            "tag:a@@text():Provider",
-            "tag:a@@text()=Provider",
-        ]:
-            try:
-                ele = page.ele(locator, timeout=5)
-                if ele:
-                    provider_btn = ele
-                    break
-            except Exception:
-                continue
-
-        if provider_btn is None:
-            raise Exception("Tidak bisa menemukan menu 'Provider'")
-        provider_btn.click()
-        time.sleep(2)
-
-        # --- Klik Antigravity ---
-        print(" [4/8] Klik 'Antigravity'...")
-        antigravity_btn = None
-        for locator in [
-            "@text()=Antigravity",
-            "@text():Antigravity",
-            "tag:a@@text():Antigravity",
-            "tag:h3@@text():Antigravity",
-        ]:
-            try:
-                ele = page.ele(locator, timeout=5)
-                if ele:
-                    antigravity_btn = ele
-                    break
-            except Exception:
-                continue
-
-        if antigravity_btn is None:
-            raise Exception("Tidak bisa menemukan 'Antigravity'")
-        antigravity_btn.click()
-        time.sleep(2)
+        time.sleep(3)
 
         # --- Klik Add ---
-        print(" [5/8] Klik tombol 'Add'...")
+        print(" [3/6] Klik tombol 'Add'...")
         add_btn = None
         for locator in [
             "tag:button@@text():Add Connection",
@@ -285,7 +301,7 @@ def login_account(account, index, total, headless=False):
             "tag:button@@text()=Add Connection",
         ]:
             try:
-                ele = page.ele(locator, timeout=5)
+                ele = page.ele(locator, timeout=8)
                 if ele:
                     add_btn = ele
                     break
@@ -298,13 +314,13 @@ def login_account(account, index, total, headless=False):
         time.sleep(1)
 
         # --- Klik Confirm (I Understand / Continue) ---
-        print(" [6/8] Klik konfirmasi (I Understand / Continue)...")
+        print(" [4/6] Klik konfirmasi (I Understand / Continue)...")
         confirm_btn = None
         for locator in [
             "tag:button@@text():I Understand",
+            "tag:button@@text():I understand",
             "tag:button@@text():Continue",
             "tag:button@@text():Confirm",
-            "tag:button@@text():I understand",
         ]:
             try:
                 ele = page.ele(locator, timeout=5)
@@ -319,7 +335,7 @@ def login_account(account, index, total, headless=False):
         confirm_btn.click()
 
         # --- Tunggu tab baru (Google Login) ---
-        print(" [7/8] Menunggu tab Google Login...")
+        print(" [5/6] Menunggu tab Google Login...")
         time.sleep(5)
 
         # Cari tab Google
@@ -346,11 +362,9 @@ def login_account(account, index, total, headless=False):
         time.sleep(2)
 
         # --- Input Email ---
-        print(f" [8/8] Login Google: {email}")
+        print(f" [6/6] Login Google: {email}")
         print("        Input email...")
-        email_field = wait_and_find(page, "#identifierId", timeout=15, desc="email field")
-        email_field.clear()
-        email_field.input(email)
+        force_input(page, "#identifierId", email, timeout=15, desc="email field")
         time.sleep(1)
 
         # Klik Next (email)
@@ -376,25 +390,23 @@ def login_account(account, index, total, headless=False):
 
         # --- Input Password ---
         print("        Input password...")
-        pw_field = None
-        for locator in [
+        pw_locators = [
             "@type=password",
-            "#password input",
             "tag:input@@type=password",
             "@name=Passwd",
-        ]:
+            "#password input",
+        ]
+        pw_done = False
+        for loc in pw_locators:
             try:
-                ele = page.ele(locator, timeout=10)
-                if ele:
-                    pw_field = ele
-                    break
+                force_input(page, loc, password, timeout=10, desc="password field")
+                pw_done = True
+                break
             except Exception:
                 continue
 
-        if pw_field is None:
-            raise Exception("Tidak bisa menemukan field password")
-        pw_field.clear()
-        pw_field.input(password)
+        if not pw_done:
+            raise Exception("Tidak bisa menemukan/input field password")
         time.sleep(1)
 
         # Klik Next (password)
