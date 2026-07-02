@@ -197,54 +197,65 @@ def force_input(page, locator, text, timeout=15, desc="field"):
 
     Google Login sering block .input() biasa karena JS event handler.
     Urutan strategi:
-    1. Klik field -> .input() DrissionPage (paling clean)
-    2. Klik field -> ketik pake .type() satu-satu (simulasi keyboard)
-    3. Klik field -> run JS langsung set value + trigger event
+    1. .input(clear=True) — cara standar DrissionPage
+    2. .input(by_js=True) — set value via JavaScript property
+    3. Klik field -> page.actions.input() — simulasi keyboard CDP
+    4. ele.run_js() — inject value + dispatch event langsung
     """
+    from DrissionPage._units.actions import Keys
+
     ele = wait_and_find(page, locator, timeout=timeout, desc=desc)
 
-    # Strategi 1: .input() standar DrissionPage
+    # Strategi 1: .input() standar DrissionPage (klik + ketik native)
     try:
-        ele.click()
-        time.sleep(0.5)
         ele.input(text, clear=True)
         time.sleep(0.5)
-        # Cek apakah value masuk
-        val = ele.attr("value") or ""
+        val = ele.attr("value") or ele.property("value") or ""
         if text in val:
             return ele
     except Exception:
         pass
 
-    # Strategi 2: .type() — simulasi keyboard char-by-char
+    # Strategi 2: .input(by_js=True) — set value via JS property + change event
     try:
-        ele.click()
-        time.sleep(0.3)
-        # Clear dulu pake Ctrl+A lalu Delete
-        page.actions.key_down("Control").type("a").key_up("Control").type("\b")
-        time.sleep(0.3)
-        page.actions.type(text)
+        ele.input(text, clear=True, by_js=True)
         time.sleep(0.5)
-        val = ele.attr("value") or ""
+        val = ele.attr("value") or ele.property("value") or ""
         if text in val:
             return ele
     except Exception:
         pass
 
-    # Strategi 3: JavaScript langsung
+    # Strategi 3: Klik field -> clear manual -> page.actions.input()
     try:
         ele.click()
         time.sleep(0.3)
-        page.run_js(
+        # Clear: Ctrl+A lalu Backspace
+        page.actions.key_down(Keys.CTRL).type("a").key_up(Keys.CTRL)
+        time.sleep(0.2)
+        page.actions.type(Keys.BACKSPACE)
+        time.sleep(0.3)
+        # Input via CDP keyboard events
+        page.actions.input(text)
+        time.sleep(0.5)
+        val = ele.attr("value") or ele.property("value") or ""
+        if text in val:
+            return ele
+    except Exception:
+        pass
+
+    # Strategi 4: JavaScript langsung ke elemen (ele.run_js, bukan page.run_js)
+    try:
+        ele.click()
+        time.sleep(0.3)
+        ele.run_js(
             """
-            const el = arguments[0];
-            const text = arguments[1];
-            el.focus();
-            el.value = text;
-            el.dispatchEvent(new Event('input', {bubbles: true}));
-            el.dispatchEvent(new Event('change', {bubbles: true}));
+            this.focus();
+            this.value = arguments[0];
+            this.dispatchEvent(new Event('input', {bubbles: true}));
+            this.dispatchEvent(new Event('change', {bubbles: true}));
             """,
-            ele, text,
+            text,
         )
         time.sleep(0.5)
         return ele
