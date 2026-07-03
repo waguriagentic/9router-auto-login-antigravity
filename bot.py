@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 SCRIPT_DIR = Path(__file__).parent
 AKUN_FILE = SCRIPT_DIR / "akun.txt"
 DB_PATH = Path.home() / ".9router" / "db" / "data.sqlite"
+CALLBACK_PORT = 8080
 PROFILE_ID = "f4fd225c-2066-45c3-9e3f-f1a116c60f87"
 CDP_BASE = f"http://127.0.0.1:8080/api/profiles/{PROFILE_ID}"
 
@@ -275,7 +276,7 @@ def remove_account(path, raw_line):
 # ── Browser flow (CloakBrowser CDP) ────────────────────────
 def google_oauth_flow(email, password):
     """Run Google OAuth via CloakBrowser CDP, return auth_code."""
-    redirect_uri = "http://localhost:8080/callback"
+    redirect_uri = f"http://localhost:{CALLBACK_PORT}/callback"
     state = uuid.uuid4().hex
     params = {
         "client_id": CLIENT_ID,
@@ -296,23 +297,48 @@ def google_oauth_flow(email, password):
         # Enable Page events
         page.send("Page.enable")
 
-        # Navigate to Google OAuth (fresh profile, no cookies to clear)
+        # Clear all cookies first to ensure fresh login
+        print(f"    Clearing cookies...")
+        page.send("Network.enable")
+        page.send("Network.clearBrowserCookies")
+        time.sleep(1)
+
+        # Navigate to Google OAuth
         print(f"    Navigating to Google OAuth...")
         page.navigate(auth_url)
-        time.sleep(5)
+        time.sleep(6)  # Wait longer for Google to process
 
         # Check current URL
         url = page.eval("document.location.href")
         print(f"    URL: {(url or '')[:120]}")
 
-        # Email field should be visible (cookies cleared → no account chooser)
-        has_email_field = page.eval("!!document.querySelector('#identifierId')")
+        # If still on account chooser, force navigation to identifier
+        if "accountchooser" in (url or ""):
+            print(f"    Still on account chooser, forcing navigation to identifier...")
+            # Force navigate to identifier page directly
+            identifier_url = f"https://accounts.google.com/v3/signin/identifier?{urlencode(params)}"
+            page.navigate(identifier_url)
+            time.sleep(5)
+            url = page.eval("document.location.href")
+            print(f"    New URL: {(url or '')[:120]}")
 
+        # Now check for email field
+        has_email_field = page.eval("!!document.querySelector('#identifierId')")
+        print(f"    Email field present: {has_email_field}")
+        
         if has_email_field:
+            # Clear field first in case it's pre-filled from login_hint
+            page.eval("""
+                const field = document.querySelector('#identifierId');
+                if (field) {
+                    field.value = '';
+                    field.focus();
+                }
+            """)
+            time.sleep(0.5)
+            
             # Input email via CDP keyboard (JS value= doesn't trigger Google's handlers)
             print(f"    Inputting email: {email}")
-            page.eval("document.querySelector('#identifierId')?.focus()")
-            time.sleep(0.3)
             page.type_text(email)
             time.sleep(0.5)
 
@@ -322,6 +348,8 @@ def google_oauth_flow(email, password):
 
         # Check for password field
         has_password = page.eval("!!document.querySelector('input[type=password], input[name=Passwd]')")
+        print(f"    Password field present: {has_password}")
+        
         if not has_password:
             # Maybe error or different page
             url = page.eval("document.location.href")
@@ -349,7 +377,24 @@ def google_oauth_flow(email, password):
 
         # Click Next (password)
         page.eval("document.querySelector('#passwordNext button, #passwordNext')?.click()")
-        time.sleep(6)
+        time.sleep(8)  # Wait longer for Google to process
+
+        # Check for error messages
+        error_msg = page.eval("""
+            Array.from(document.querySelectorAll('[jsname="B34EJ"], [class*="error"], [role="alert"]'))
+                .map(e => e.textContent.trim())
+                .filter(t => t.length > 0)
+                .join(' | ')
+        """)
+        if error_msg:
+            print(f"    [WARN] Google error: {error_msg[:200]}")
+            raise Exception(f"Google login error: {error_msg[:200]}")
+
+        # Check if we're still on password page (login failed)
+        still_on_password = page.eval("!!document.querySelector('input[type=password], input[name=Passwd]')")
+        if still_on_password:
+            print(f"    [WARN] Still on password page after submit - likely wrong credentials")
+            raise Exception("Login failed - still on password page (check credentials)")
 
         # Handle consent screens
         print(f"    Handling Google consent...")
@@ -419,7 +464,7 @@ def google_oauth_flow(email, password):
         time.sleep(5)
 
         # Extract auth code from redirect URL
-        print(f"    Extracting auth code...")
+        print(f"    Extracting auth code from redirect...")
         for _ in range(30):
             url = page.eval("document.location.href") or ""
             if "code=" in url:
@@ -434,7 +479,7 @@ def google_oauth_flow(email, password):
                 raise Exception(f"Google OAuth error: {error} — {desc}")
             time.sleep(1)
 
-        raise Exception(f"Could not extract auth code. Final URL: {url[:200]}")
+        raise Exception(f"Could not extract auth code. Browser URL: {url[:200]}")
 
     finally:
         page.close()
