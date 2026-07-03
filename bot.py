@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 SCRIPT_DIR = Path(__file__).parent
 AKUN_FILE = SCRIPT_DIR / "akun.txt"
 DB_PATH = Path.home() / ".9router" / "db" / "data.sqlite"
-PROFILE_ID = "9febcfa9-40d4-4c8c-a515-4d9b22238d6e"
+PROFILE_ID = "f4fd225c-2066-45c3-9e3f-f1a116c60f87"
 CDP_BASE = f"http://127.0.0.1:8080/api/profiles/{PROFILE_ID}"
 
 # ── Load .env ───────────────────────────────────────────────
@@ -296,11 +296,7 @@ def google_oauth_flow(email, password):
         # Enable Page events
         page.send("Page.enable")
 
-        # Clear Google cookies to avoid account chooser
-        page.send("Network.enable")
-        page.send("Network.clearBrowserCookies")
-
-        # Navigate to Google OAuth
+        # Navigate to Google OAuth (fresh profile, no cookies to clear)
         print(f"    Navigating to Google OAuth...")
         page.navigate(auth_url)
         time.sleep(5)
