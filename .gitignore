@@ -1,37 +1,5 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environment
-venv/
 .venv/
-env/
-.env/
-
-# DrissionPage
-.DrissionPage/
-
-# Akun (SENSITIF - JANGAN COMMIT!)
+*.pyc
 akun.txt
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Node.js (legacy)
-node_modules/
-package-lock.json
+.env
