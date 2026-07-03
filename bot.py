@@ -1,66 +1,43 @@
 #!/usr/bin/env python3
 """
-Antigravity Auto-Add Account (Hybrid Mode)
+Antigravity Auto-Add Account (Hybrid Mode — CloakBrowser CDP)
 
-Browser = Google OAuth only (login + consent).
+Browser = CloakBrowser Docker via raw CDP for Google OAuth only.
 Token exchange, loadCodeAssist, onboardUser, DB inject = pure HTTP.
 
 Usage:
-  python3 bot.py                    # normal (visible browser)
-  python3 bot.py --headless         # headless browser
-  python3 bot.py --delay 5          # delay between accounts (seconds)
+  python3 bot.py                    # visible browser
+  python3 bot.py --delay 5          # delay between accounts
   python3 bot.py --file akun.txt    # custom accounts file
-  python3 bot.py --db ~/.9router/db/data.sqlite  # custom 9router DB path
 """
 
-import os, sys, subprocess, tempfile, shutil, random, time, argparse, json, sqlite3, uuid
+import os, sys, json, uuid, random, shutil, time, argparse, sqlite3
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VENV_DIR = os.path.join(SCRIPT_DIR, ".venv")
-AKUN_FILE = os.path.join(SCRIPT_DIR, "akun.txt")
-DB_PATH = os.path.expanduser("~/.9router/db/data.sqlite")
-DELAY_ANTAR_AKUN = 3
+SCRIPT_DIR = Path(__file__).parent
+AKUN_FILE = SCRIPT_DIR / "akun.txt"
+DB_PATH = Path.home() / ".9router" / "db" / "data.sqlite"
+PROFILE_ID = "9febcfa9-40d4-4c8c-a515-4d9b22238d6e"
+CDP_BASE = f"http://127.0.0.1:8080/api/profiles/{PROFILE_ID}"
 
-# ── Auto-installer ──────────────────────────────────────────
-def _ensure_drissionpage():
-    try:
-        import DrissionPage  # noqa: F401
-        return
-    except ImportError:
-        pass
+# ── Load .env ───────────────────────────────────────────────
+_env_path = SCRIPT_DIR / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
 
-    print("[*] DrissionPage not installed, installing...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "DrissionPage"],
-                              stdout=sys.stdout, stderr=sys.stderr)
-        return
-    except subprocess.CalledProcessError:
-        pass
-
-    print("[*] pip failed, creating venv...")
-    subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR],
-                          stdout=sys.stdout, stderr=sys.stderr)
-    venv_py = os.path.join(VENV_DIR, "Scripts" if sys.platform == "win32" else "bin", "python3")
-    subprocess.check_call([venv_py, "-m", "pip", "install", "--upgrade", "pip"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.check_call([venv_py, "-m", "pip", "install", "DrissionPage"],
-                          stdout=sys.stdout, stderr=sys.stderr)
-    os.execv(venv_py, [venv_py] + sys.argv)
-
-_ensure_drissionpage()
-
-from DrissionPage import ChromiumPage, ChromiumOptions
-from DrissionPage._units.actions import Keys
-
-# ── Antigravity OAuth constants (from 9router source) ──────
 CLIENT_ID = os.environ.get("AG_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("AG_CLIENT_SECRET", "")
 if not CLIENT_ID or not CLIENT_SECRET:
-    print("[!] AG_CLIENT_ID / AG_CLIENT_SECRET not set. Copy .env.example to .env and fill in values.")
+    print("[!] AG_CLIENT_ID / AG_CLIENT_SECRET not set. Copy .env.example to .env")
     sys.exit(1)
 
+# ── Antigravity OAuth constants ─────────────────────────────
 AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo"
@@ -73,23 +50,107 @@ SCOPES = [
     "https://www.googleapis.com/auth/cclog",
     "https://www.googleapis.com/auth/experimentsandconfigs",
 ]
-# Linux x86_64
-PLATFORM_ENUM = 3  # LINUX_AMD64
-CLIENT_METADATA = json.dumps({"ideType": 9, "platform": PLATFORM_ENUM, "pluginType": 2})
-USER_AGENT = "antigravity/1.107.0 linux/x86_64"
+CLIENT_METADATA = {"ideType": 9, "platform": 3, "pluginType": 2}
 LOAD_HEADERS = {
-    "Authorization": "",  # filled at runtime
     "Content-Type": "application/json",
     "User-Agent": "google-api-nodejs-client/9.15.1",
     "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-    "Client-Metadata": CLIENT_METADATA,
+    "Client-Metadata": json.dumps(CLIENT_METADATA),
     "x-request-source": "local",
 }
 
 
+# ── CDP helper ──────────────────────────────────────────────
+class CDPPage:
+    """Minimal CDP client over websocket."""
+
+    def __init__(self, ws_url):
+        import websocket
+        self.ws = websocket.create_connection(ws_url, timeout=30)
+        self._id = 0
+
+    def send(self, method, params=None):
+        self._id += 1
+        msg = {"id": self._id, "method": method}
+        if params:
+            msg["params"] = params
+        self.ws.send(json.dumps(msg))
+        # Read until we get our response
+        while True:
+            r = json.loads(self.ws.recv())
+            if r.get("id") == self._id:
+                return r
+
+    def navigate(self, url):
+        return self.send("Page.navigate", {"url": url})
+
+    def eval(self, expression):
+        r = self.send("Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        })
+        return r.get("result", {}).get("result", {}).get("value")
+
+    def type_text(self, text):
+        """Type text using CDP Input.dispatchKeyEvent (bypasses JS value= issue)."""
+        for ch in text:
+            self.send("Input.dispatchKeyEvent", {"type": "keyDown", "text": ch, "key": ch})
+            self.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": ch})
+            time.sleep(0.02)
+
+    def click_at(self, x, y):
+        """Click at coordinates using CDP Input.dispatchMouseEvent (bypasses JS .click() issues)."""
+        self.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+        self.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+
+    def close(self):
+        self.ws.close()
+
+
+def get_page_ws():
+    """Get a page websocket URL from CloakBrowser Docker."""
+    import urllib.request
+    # Get targets
+    req = urllib.request.Request(f"{CDP_BASE}/cdp/json")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        targets = json.loads(resp.read())
+    # Find about:blank page or use first page
+    for t in targets:
+        if t.get("type") == "page" and t.get("url") == "about:blank":
+            return t["webSocketDebuggerUrl"]
+    # Create new page
+    for t in targets:
+        if t.get("type") == "page":
+            return t["webSocketDebuggerUrl"]
+    raise Exception("No page target found")
+
+
+def ensure_cloakbrowser_running():
+    """Ensure CloakBrowser profile is running."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"{CDP_BASE}/status")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = json.loads(resp.read())
+        if status.get("status") == "running":
+            return True
+    except Exception:
+        pass
+    # Try to launch
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"{CDP_BASE}/launch", method="POST",
+                                     data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return True
+    except Exception as e:
+        raise Exception(f"Failed to launch CloakBrowser: {e}")
+
+
 # ── HTTP helpers ────────────────────────────────────────────
 def exchange_code(code, redirect_uri):
-    """Exchange authorization code for access_token + refresh_token."""
     import urllib.request, urllib.parse
     data = urllib.parse.urlencode({
         "grant_type": "authorization_code",
@@ -107,61 +168,59 @@ def exchange_code(code, redirect_uri):
 
 
 def get_user_info(access_token):
-    """Get email from Google userinfo API."""
     import urllib.request
     req = urllib.request.Request(f"{USERINFO_URL}?alt=json", headers={
         "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
     })
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
 
 
 def load_code_assist(access_token):
-    """Fetch projectId + tierId from loadCodeAssist."""
     import urllib.request
     headers = {**LOAD_HEADERS, "Authorization": f"Bearer {access_token}"}
-    data = json.dumps({"metadata": json.loads(CLIENT_METADATA)}).encode()
+    data = json.dumps({"metadata": CLIENT_METADATA}).encode()
     req = urllib.request.Request(LOAD_CODE_ASSIST_URL, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=30) as resp:
         result = json.loads(resp.read())
-
     project_id = ""
-    raw_proj = result.get("cloudaicompanionProject")
-    if isinstance(raw_proj, dict):
-        project_id = raw_proj.get("id", "")
-    elif isinstance(raw_proj, str):
-        project_id = raw_proj
-
+    raw = result.get("cloudaicompanionProject")
+    if isinstance(raw, dict):
+        project_id = raw.get("id", "")
+    elif isinstance(raw, str):
+        project_id = raw
     tier_id = "legacy-tier"
     for tier in result.get("allowedTiers", []):
         if tier.get("isDefault") and tier.get("id"):
             tier_id = tier["id"].strip()
             break
-
     return project_id, tier_id
 
 
-def onboard_user(access_token, tier_id, max_retries=10):
-    """Onboard user (activate service). Polls until done."""
+def onboard_user(access_token, project_id, tier_id, max_retries=10):
+    """Onboard user with projectId in request body (required by Google API)."""
     import urllib.request
     headers = {**LOAD_HEADERS, "Authorization": f"Bearer {access_token}"}
-    metadata = json.loads(CLIENT_METADATA)
-    data = json.dumps({"tierId": tier_id, "metadata": metadata}).encode()
-
+    # ✅ projectId MUST be included in the request body
+    data = json.dumps({
+        "tierId": tier_id, 
+        "metadata": CLIENT_METADATA,
+        "projectId": project_id  # This is required!
+    }).encode()
+    
     for attempt in range(max_retries):
-        req = urllib.request.Request(ONBOARD_USER_URL, data=data, headers=headers, method="POST")
         try:
+            req = urllib.request.Request(ONBOARD_USER_URL, data=data, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=30) as resp:
                 result = json.loads(resp.read())
             if result.get("done"):
-                # Extract final projectId
                 resp_proj = result.get("response", {}).get("cloudaicompanionProject", "")
                 if isinstance(resp_proj, str):
                     return resp_proj.strip()
                 elif isinstance(resp_proj, dict):
                     return resp_proj.get("id", "")
-                return ""
+                # If no project in response, return the original projectId
+                return project_id
         except Exception as e:
             print(f"    [WARN] onboard attempt {attempt+1}: {e}")
         time.sleep(5)
@@ -169,7 +228,6 @@ def onboard_user(access_token, tier_id, max_retries=10):
 
 
 def inject_to_9router(email, access_token, refresh_token, project_id, db_path):
-    """Insert antigravity connection directly into 9router SQLite."""
     conn_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{random.randint(100,999)}Z"
     data = json.dumps({
@@ -179,7 +237,7 @@ def inject_to_9router(email, access_token, refresh_token, project_id, db_path):
         "testStatus": "active",
         "lastRefreshAt": now,
     })
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
             "INSERT INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) "
@@ -192,115 +250,32 @@ def inject_to_9router(email, access_token, refresh_token, project_id, db_path):
         conn.close()
 
 
-# ── Browser helpers ─────────────────────────────────────────
-def find_and_click(page_or_tab, locators, timeout=5, desc="element"):
-    for locator in locators:
-        try:
-            ele = page_or_tab.ele(locator, timeout=timeout)
-            if ele:
-                ele.click()
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def force_input(page_or_tab, locator, text, timeout=15, desc="field"):
-    ele = page_or_tab.ele(locator, timeout=timeout)
-    if ele is None:
-        raise Exception(f"Element {desc} not found: {locator}")
-
-    # Strategy 1: standard .input()
-    try:
-        ele.input(text, clear=True)
-        time.sleep(0.5)
-        val = ele.attr("value") or ele.property("value") or ""
-        if text in val:
-            return ele
-    except Exception:
-        pass
-
-    # Strategy 2: .input(by_js=True)
-    try:
-        ele.input(text, clear=True, by_js=True)
-        time.sleep(0.5)
-        val = ele.attr("value") or ele.property("value") or ""
-        if text in val:
-            return ele
-    except Exception:
-        pass
-
-    # Strategy 3: CDP keyboard
-    try:
-        ele.click()
-        time.sleep(0.3)
-        page_or_tab.actions.key_down(Keys.CTRL).type("a").key_up(Keys.CTRL)
-        time.sleep(0.2)
-        page_or_tab.actions.type(Keys.BACKSPACE)
-        time.sleep(0.3)
-        page_or_tab.actions.input(text)
-        time.sleep(0.5)
-        val = ele.attr("value") or ele.property("value") or ""
-        if text in val:
-            return ele
-    except Exception:
-        pass
-
-    # Strategy 4: JS direct
-    try:
-        ele.click()
-        time.sleep(0.3)
-        ele.run_js("""
-            this.focus();
-            this.value = arguments[0];
-            this.dispatchEvent(new Event('input', {bubbles: true}));
-            this.dispatchEvent(new Event('change', {bubbles: true}));
-        """, text)
-        time.sleep(0.5)
-        return ele
-    except Exception:
-        pass
-
-    raise Exception(f"Failed to input text to {desc} with all strategies")
-
-
+# ── Account helpers ─────────────────────────────────────────
 def read_accounts(path):
-    if not os.path.exists(path):
+    if not path.exists():
         return []
-    with open(path, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
     accounts = []
-    for line in lines:
+    for line in path.read_text().splitlines():
+        line = line.strip()
         if "|" not in line:
             continue
         parts = line.split("|", 1)
-        email, password = parts[0].strip(), parts[1].strip()
-        if email and password:
-            accounts.append({"email": email, "password": password, "raw": line})
+        if parts[0].strip() and parts[1].strip():
+            accounts.append({"email": parts[0].strip(), "password": parts[1].strip(), "raw": line})
     return accounts
 
 
 def remove_account(path, raw_line):
-    if not os.path.exists(path):
+    if not path.exists():
         return
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    remaining = [line for line in lines if line.strip() != raw_line]
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(remaining)
+    lines = [l for l in path.read_text().splitlines() if l.strip() != raw_line]
+    path.write_text("\n".join(lines) + "\n")
 
 
-# ── Main flow ───────────────────────────────────────────────
-def process_account(account, index, total, headless=False, db_path=DB_PATH):
-    email = account["email"]
-    password = account["password"]
+# ── Browser flow (CloakBrowser CDP) ────────────────────────
+def google_oauth_flow(email, password):
+    """Run Google OAuth via CloakBrowser CDP, return auth_code."""
     redirect_uri = "http://localhost:8080/callback"
-
-    print(f"\n{'='*55}")
-    print(f" Account {index+1}/{total}: {email}")
-    print(f"{'='*55}")
-
-    # Build auth URL
     state = uuid.uuid4().hex
     params = {
         "client_id": CLIENT_ID,
@@ -311,155 +286,218 @@ def process_account(account, index, total, headless=False, db_path=DB_PATH):
         "access_type": "offline",
         "prompt": "consent",
     }
-    from urllib.parse import urlencode
     auth_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
 
-    # ── Step 1: Browser — Google OAuth only ──
-    print(" [1/6] Starting browser for Google OAuth...")
-    tmp_user_data = tempfile.mkdtemp(prefix="antigravity_")
-    co = ChromiumOptions()
-    co.set_argument("--start-maximized")
-    co.set_argument("--disable-blink-features=AutomationControlled")
-    co.set_argument("--no-first-run")
-    co.set_argument("--no-default-browser-check")
-    co.set_user_data_path(tmp_user_data)
-    co.set_local_port(random.randint(19200, 29200))
-    if headless:
-        co.headless(True)
-
-    page = ChromiumPage(co)
-    auth_code = None
+    print(f"    Connecting to CloakBrowser CDP...")
+    page_ws = get_page_ws()
+    page = CDPPage(page_ws)
 
     try:
-        # Navigate directly to Google OAuth (skip 9router UI entirely)
-        print(f" [2/6] Navigating to Google OAuth...")
-        page.get(auth_url)
+        # Enable Page events
+        page.send("Page.enable")
+
+        # Clear Google cookies to avoid account chooser
+        page.send("Network.enable")
+        page.send("Network.clearBrowserCookies")
+
+        # Navigate to Google OAuth
+        print(f"    Navigating to Google OAuth...")
+        page.navigate(auth_url)
+        time.sleep(5)
+
+        # Check current URL
+        url = page.eval("document.location.href")
+        print(f"    URL: {(url or '')[:120]}")
+
+        # Email field should be visible (cookies cleared → no account chooser)
+        has_email_field = page.eval("!!document.querySelector('#identifierId')")
+
+        if has_email_field:
+            # Input email via CDP keyboard (JS value= doesn't trigger Google's handlers)
+            print(f"    Inputting email: {email}")
+            page.eval("document.querySelector('#identifierId')?.focus()")
+            time.sleep(0.3)
+            page.type_text(email)
+            time.sleep(0.5)
+
+            # Click Next
+            page.eval("document.querySelector('#identifierNext button, #identifierNext')?.click()")
+            time.sleep(5)
+
+        # Check for password field
+        has_password = page.eval("!!document.querySelector('input[type=password], input[name=Passwd]')")
+        if not has_password:
+            # Maybe error or different page
+            url = page.eval("document.location.href")
+            title = page.eval("document.title")
+            print(f"    [DEBUG] URL: {(url or '')[:150]}")
+            print(f"    [DEBUG] Title: {title}")
+
+            # Check for error
+            error_text = page.eval("""
+                Array.from(document.querySelectorAll('[class*=error], [class*=LgSUxe], [jsname=B34EJ]'))
+                    .map(e => e.textContent.trim())
+                    .filter(t => t.length > 0)
+                    .join(' | ')
+            """)
+            if error_text:
+                print(f"    [DEBUG] Error: {error_text[:150]}")
+            raise Exception("Password field not found after email step")
+
+        # Input password via CDP keyboard
+        print(f"    Inputting password...")
+        page.eval("document.querySelector('input[type=password], input[name=Passwd]')?.focus()")
+        time.sleep(0.3)
+        page.type_text(password)
+        time.sleep(0.5)
+
+        # Click Next (password)
+        page.eval("document.querySelector('#passwordNext button, #passwordNext')?.click()")
+        time.sleep(6)
+
+        # Handle consent screens
+        print(f"    Handling Google consent...")
+        # Try I Understand / consent
+        page.eval("""
+            (() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const txt = b.textContent.trim().toLowerCase();
+                    if (txt.includes('i understand') || txt.includes('i agree') || 
+                        txt.includes('saya memahami') || txt.includes('gaplustos')) {
+                        b.click();
+                        return 'clicked_consent';
+                    }
+                }
+                return 'no_consent';
+            })()
+        """)
         time.sleep(3)
 
-        # Input email
-        print(f" [3/6] Logging in: {email}")
-        force_input(page, "#identifierId", email, timeout=15, desc="email")
-        time.sleep(1)
+        # Click Allow/Login (critical — GSuite shows "Login", regular shows "Allow")
+        # Must use CDP mouse click because Google consent page ignores JS .click()
+        print(f"    Clicking Allow/Login...")
+        time.sleep(2)  # Wait for consent page to fully render
+        allow_pos = page.eval("""
+            (() => {
+                const btns = document.querySelectorAll('button, input[type=submit]');
+                for (const b of btns) {
+                    const txt = (b.textContent || b.value || '').trim().toLowerCase();
+                    if (txt === 'login' || txt === 'allow' || txt === 'izinkan' || 
+                        txt === 'masuk' || txt.includes('submit_approve')) {
+                        const rect = b.getBoundingClientRect();
+                        return JSON.stringify({x: rect.x + rect.width/2, y: rect.y + rect.height/2});
+                    }
+                }
+                const el = document.querySelector('#submit_approve_access');
+                if (el) {
+                    const rect = el.getBoundingClientRect();
+                    return JSON.stringify({x: rect.x + rect.width/2, y: rect.y + rect.height/2});
+                }
+                return null;
+            })()
+        """)
 
-        if not find_and_click(page, ["#identifierNext", "tag:button@@text():Next"], timeout=5, desc="Next(email)"):
-            raise Exception("Next button (email) not found")
-        time.sleep(3)
+        if allow_pos:
+            coords = json.loads(allow_pos)
+            page.click_at(coords["x"], coords["y"])
+            allow_result = f"cdp_click_at({coords['x']:.0f},{coords['y']:.0f})"
+        else:
+            allow_result = "no_allow"
+        print(f"    Allow result: {allow_result}")
 
-        # Input password
-        pw_done = False
-        for loc in ["@type=password", "tag:input@@type=password", "@name=Passwd"]:
-            try:
-                force_input(page, loc, password, timeout=10, desc="password")
-                pw_done = True
-                break
-            except Exception:
-                continue
-        if not pw_done:
-            raise Exception("Password field not found")
-        time.sleep(1)
-
-        if not find_and_click(page, ["#passwordNext", "tag:button@@text():Next"], timeout=5, desc="Next(pw)"):
-            raise Exception("Next button (password) not found")
-        time.sleep(3)
-
-        # Handle Google consent screens
-        print(" [4/6] Handling Google consent...")
-        find_and_click(page, [
-            "#gaplustosNext",
-            "tag:button@@text():I Understand",
-            "tag:button@@text():I agree",
-        ], timeout=15, desc="I Understand")
-        time.sleep(2)
-
-        if not find_and_click(page, [
-            "#submit_approve_access",
-            "tag:button@@text():Allow",
-            "tag:button@@text():Continue",
-        ], timeout=15, desc="Allow"):
+        if allow_result == "no_allow":
+            # Debug
+            url = page.eval("document.location.href")
+            title = page.eval("document.title")
+            print(f"    [DEBUG] URL: {(url or '')[:150]}")
+            print(f"    [DEBUG] Title: {title}")
+            btns = page.eval("""
+                Array.from(document.querySelectorAll('button')).map(b => 
+                    b.textContent.trim().substring(0, 60) + ' | id=' + b.id
+                ).join('\\n')
+            """)
+            print(f"    [DEBUG] Buttons:\n    {(btns or 'none')[:300]}")
             raise Exception("Allow button not found — Google login FAILED")
-        time.sleep(3)
 
-        # Intercept redirect URL to extract auth code
-        print(" [5/6] Extracting auth code from redirect...")
-        # Wait for redirect to localhost:8080/callback
+        time.sleep(5)
+
+        # Extract auth code from redirect URL
+        print(f"    Extracting auth code...")
         for _ in range(30):
-            current_url = page.url
-            if "localhost" in current_url and "code=" in current_url:
-                parsed = urlparse(current_url)
-                qs = parse_qs(parsed.query)
+            url = page.eval("document.location.href") or ""
+            if "code=" in url:
+                qs = parse_qs(urlparse(url).query)
                 code_list = qs.get("code", [])
                 if code_list:
-                    auth_code = code_list[0]
-                    break
-            # Check if there's an error
-            if "error=" in current_url:
-                parsed = urlparse(current_url)
-                qs = parse_qs(parsed.query)
+                    return code_list[0], redirect_uri
+            if "error=" in url:
+                qs = parse_qs(urlparse(url).query)
                 error = qs.get("error", ["unknown"])[0]
                 desc = qs.get("error_description", [""])[0]
                 raise Exception(f"Google OAuth error: {error} — {desc}")
             time.sleep(1)
 
-        if not auth_code:
-            # Fallback: try to get code from page content or URL fragments
-            current_url = page.url
-            print(f"    [DEBUG] Final URL: {current_url[:120]}")
-            raise Exception("Could not extract auth code from redirect URL")
-
-        print(f"    Auth code: {auth_code[:20]}...")
+        raise Exception(f"Could not extract auth code. Final URL: {url[:200]}")
 
     finally:
-        try:
-            page.quit()
-        except Exception:
-            pass
-        try:
-            shutil.rmtree(tmp_user_data, ignore_errors=True)
-        except Exception:
-            pass
+        page.close()
 
-    # ── Step 2-5: Pure HTTP ──
+
+# ── Process one account ─────────────────────────────────────
+def process_account(account, index, total, db_path=DB_PATH):
+    email = account["email"]
+    password = account["password"]
+
+    print(f"\n{'='*55}")
+    print(f" Account {index+1}/{total}: {email}")
+    print(f"{'='*55}")
+
     try:
-        # Exchange code for tokens
-        print(" [6/6] Exchanging code for tokens...")
+        # Step 1: Browser — Google OAuth
+        print(" [1/6] Google OAuth via CloakBrowser CDP...")
+        auth_code, redirect_uri = google_oauth_flow(email, password)
+        print(f"    Auth code: {auth_code[:20]}...")
+
+        # Step 2: Exchange code → tokens
+        print(" [2/6] Exchanging code for tokens...")
         tokens = exchange_code(auth_code, redirect_uri)
         access_token = tokens.get("access_token", "")
         refresh_token = tokens.get("refresh_token", "")
         if not access_token:
-            raise Exception(f"No access_token in response: {tokens}")
+            raise Exception(f"No access_token: {tokens}")
         print(f"    access_token: {access_token[:30]}...")
-        print(f"    refresh_token: {refresh_token[:20]}..." if refresh_token else "    [WARN] No refresh_token")
+        if refresh_token:
+            print(f"    refresh_token: {refresh_token[:20]}...")
 
-        # Get user info
-        print("    Fetching user info...")
+        # Step 3: User info
+        print(" [3/6] Getting user info...")
         user_info = get_user_info(access_token)
         actual_email = user_info.get("email", email)
         print(f"    Email: {actual_email}")
 
-        # Load Code Assist → projectId
-        print("    Loading Code Assist...")
+        # Step 4: loadCodeAssist
+        print(" [4/6] Loading Code Assist...")
         project_id, tier_id = load_code_assist(access_token)
-        if not project_id:
-            print("    [WARN] No projectId found, using empty string")
-        else:
-            print(f"    Project ID: {project_id}")
+        print(f"    Project ID: {project_id or '(empty)'}")
 
-        # Onboard user
+        # Step 5: onboardUser
         if project_id:
-            print("    Onboarding user...")
-            final_project_id = onboard_user(access_token, tier_id)
-            if final_project_id:
-                project_id = final_project_id
-                print(f"    Final Project ID: {project_id}")
+            print(" [5/6] Onboarding user...")
+            final_pid = onboard_user(access_token, project_id, tier_id)
+            if final_pid:
+                project_id = final_pid
+            print(f"    Final Project ID: {project_id}")
+        else:
+            print(" [5/6] Skipping onboard (no projectId)")
 
-        # Inject into 9router DB
-        print("    Injecting into 9router DB...")
+        # Step 6: Inject into 9router DB
+        print(" [6/6] Injecting into 9router DB...")
         conn_id = inject_to_9router(actual_email, access_token, refresh_token, project_id, db_path)
-        print(f"    Connection ID: {conn_id}")
+        print(f"    Connection ID: {conn_id[:8]}...")
 
-        # Remove from accounts file
         remove_account(AKUN_FILE, account["raw"])
-        print(f"\n [SUCCESS] {actual_email} → injected into 9router (id: {conn_id[:8]}...)")
+        print(f"\n [SUCCESS] {actual_email} → 9router (id: {conn_id[:8]}...)")
         return True
 
     except Exception as e:
@@ -469,45 +507,39 @@ def process_account(account, index, total, headless=False, db_path=DB_PATH):
 
 # ── Main ────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Antigravity Auto-Add (Hybrid Mode)")
-    parser.add_argument("--headless", action="store_true", help="Run browser headless")
-    parser.add_argument("--delay", type=int, default=DELAY_ANTAR_AKUN, help="Delay between accounts (seconds)")
-    parser.add_argument("--file", type=str, default=None, help="Path to accounts file")
-    parser.add_argument("--db", type=str, default=DB_PATH, help="Path to 9router SQLite DB")
+    parser = argparse.ArgumentParser(description="Antigravity Auto-Add (Hybrid — CloakBrowser CDP)")
+    parser.add_argument("--delay", type=int, default=3, help="Delay between accounts (seconds)")
+    parser.add_argument("--file", type=str, default=None, help="Accounts file path")
+    parser.add_argument("--db", type=str, default=None, help="9router SQLite DB path")
     args = parser.parse_args()
 
-    global AKUN_FILE
+    global AKUN_FILE, DB_PATH
     if args.file:
-        AKUN_FILE = args.file
+        AKUN_FILE = Path(args.file)
+    if args.db:
+        DB_PATH = Path(args.db)
 
-    # Cleanup zombie Chrome processes
-    try:
-        if sys.platform != "win32":
-            os.system("pkill -f 'chromium.*antigravity_' 2>/dev/null")
-            os.system("pkill -f 'chrome.*antigravity_' 2>/dev/null")
-        import glob
-        for old in glob.glob(os.path.join(tempfile.gettempdir(), "antigravity_*")):
-            shutil.rmtree(old, ignore_errors=True)
-    except Exception:
-        pass
+    # Ensure CloakBrowser is running
+    print("[*] Checking CloakBrowser...")
+    ensure_cloakbrowser_running()
+    print("[*] CloakBrowser running OK")
 
     accounts = read_accounts(AKUN_FILE)
     if not accounts:
-        print("[!] No accounts found. Create akun.txt with format: email|password")
+        print("[!] No accounts. Create akun.txt: email|password")
         sys.exit(1)
 
     print(f"""
-    AntiGravity Auto-Add (Hybrid Mode)
-    ===================================
+    AntiGravity Auto-Add (Hybrid — CloakBrowser CDP)
+    ==================================================
     Accounts : {len(accounts)}
-    Headless : {'YES' if args.headless else 'NO'}
     Delay    : {args.delay}s
-    DB       : {args.db}
+    DB       : {DB_PATH}
     """)
 
     success = fail = 0
     for i, account in enumerate(accounts):
-        ok = process_account(account, i, len(accounts), headless=args.headless, db_path=args.db)
+        ok = process_account(account, i, len(accounts), db_path=DB_PATH)
         if ok:
             success += 1
         else:
